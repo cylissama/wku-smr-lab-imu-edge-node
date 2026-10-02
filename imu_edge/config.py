@@ -28,7 +28,10 @@ class EdgeAgentConfig:
     stale_after_s: int
     start_session_on_boot: bool
     stop_session_on_exit: bool
-
+    wait_for_trigger: bool  #this is the addition by umar khatab for the udp system
+    trigger_port: int
+    trigger_payload:str
+    trigger_settle_s:float
     @classmethod
     def from_env(cls) -> "EdgeAgentConfig":
         hostname = socket.gethostname()
@@ -49,4 +52,9 @@ class EdgeAgentConfig:
             stale_after_s=max(5, int(os.getenv("IMU_EDGE_STALE_AFTER_S", "30"))),
             start_session_on_boot=_env_flag("IMU_AUTO_START_SESSION", True),
             stop_session_on_exit=_env_flag("IMU_STOP_SESSION_ON_EXIT", False),
-        )
+	    wait_for_trigger=_env_flag("IMU_WAIT_FOR_UDP_TRIGGER", False), #this is the addition by umar khattab for the udp system and below
+            trigger_port=int(os.getenv("IMU_TRIGGER_UDP_PORT", "5005")),
+            trigger_payload=os.getenv("IMU_TRIGGER_PAYLOAD", "1"),
+            trigger_settle_s=float(os.getenv("IMU_TRIGGER_SETTLE_S", "1.0")),
+        
+)
