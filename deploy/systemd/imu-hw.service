@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=pi
-Group=pi
+User=admin
+Group=admin
 SupplementaryGroups=i2c gpio
 WorkingDirectory=/opt/smart-mfg-imu
 Environment=IMU_SOCKET_PATH=/run/imu-hw/imu.sock
