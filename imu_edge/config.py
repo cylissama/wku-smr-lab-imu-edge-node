@@ -28,6 +28,14 @@ class EdgeAgentConfig:
     stale_after_s: int
     start_session_on_boot: bool
     stop_session_on_exit: bool
+    plc_trigger: bool
+    plc_path: str
+    plc_tag_start: str
+    plc_tag_tare: str
+    plc_tag_stop: str
+    plc_poll_s: float
+    plc_fake: bool
+    plc_fake_speed: float
 
     @classmethod
     def from_env(cls) -> "EdgeAgentConfig":
@@ -49,4 +57,12 @@ class EdgeAgentConfig:
             stale_after_s=max(5, int(os.getenv("IMU_EDGE_STALE_AFTER_S", "30"))),
             start_session_on_boot=_env_flag("IMU_AUTO_START_SESSION", True),
             stop_session_on_exit=_env_flag("IMU_STOP_SESSION_ON_EXIT", False),
+            plc_trigger=_env_flag("IMU_PLC_TRIGGER", False),
+            plc_path=os.getenv("IMU_PLC_PATH", "192.168.1.103"),
+            plc_tag_start=os.getenv("IMU_PLC_TAG_START", "Data_Start"),
+            plc_tag_tare=os.getenv("IMU_PLC_TAG_TARE", "IMU_Tare"),
+            plc_tag_stop=os.getenv("IMU_PLC_TAG_STOP", "Db_Stop"),
+            plc_poll_s=max(0.01, float(os.getenv("IMU_PLC_POLL_S", "0.05"))),
+            plc_fake=_env_flag("IMU_PLC_FAKE", False),
+            plc_fake_speed=float(os.getenv("IMU_PLC_FAKE_SPEED", "1.0")),
         )
