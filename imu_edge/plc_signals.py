@@ -1,12 +1,15 @@
 """
 Watch the robot cell's PLC for the signals that drive a capture run.
 
-    Data_Start ON   -> start capturing IMU data (not sending yet)
-    IMU_Tare ON     -> tare once, then start sending
-    Data_Start OFF  -> stop        (Db_Stop ON also stops)
+The PLC raises each signal as a short pulse, so the watcher counts each time
+a tag turns ON (a rising edge) instead of looking at whether it is on now:
 
-The watcher polls the tags in a background thread so the agent can keep
-reading IMU samples while it waits for a signal.
+    Data_Start turns ON  -> start the run: stream and send IMU data
+    IMU_Tare turns ON    -> tare, keep sending
+    Db_Stop turns ON     -> stop the run
+
+A tag turning OFF again is ignored. The watcher polls the tags in a background
+thread so the agent can keep reading IMU samples between signals.
 """
 import threading
 import time
@@ -19,14 +22,15 @@ FakeTag = namedtuple("FakeTag", "tag value type error")
 class FakePLC:
     """
     Stand-in for pycomm3's LogixDriver, for testing without the robot.
-    Plays back the signal sequence of the robot program SJOINT1.
+    Plays back the PLC signal pattern seen in the lab with SJOINT1.
     """
 
     DEFAULT_TIMELINE = [
-        (3.0, "Data_Start", True),    # DO[29:RPi_START]=ON
-        (10.0, "IMU_Tare", True),     # DO[30:TARE_START]=ON  (after the jerk)
-        (11.0, "IMU_Tare", False),    # 1 s later
-        (25.0, "Data_Start", False),  # DO[29:RPi_START]=OFF
+        (3.0, "Data_Start", True),   # start pulse
+        (4.0, "Data_Start", False),
+        (10.0, "IMU_Tare", True),    # tare pulse, after the jerk
+        (11.0, "IMU_Tare", False),
+        (25.0, "Db_Stop", True),     # end of the run (stays on)
     ]
 
     def __init__(self, timeline=None, speed: float = 1.0, **_ignored):
@@ -87,9 +91,10 @@ class PLCSignalWatcher:
         self._retry_delay_s = retry_delay_s
 
         self._lock = threading.Lock()
-        self._start = False
-        self._stop = False
-        self._tare_count = 0
+        # How many times each tag has turned ON since the watcher started.
+        self._counts = {tag: 0 for tag in self._tags}
+        # The value each tag had at the last read.
+        self._values = {tag: False for tag in self._tags}
         self._connected = False
         self._last_error: str | None = None
 
@@ -104,16 +109,28 @@ class PLCSignalWatcher:
         self._thread.join(timeout=5)
 
     @property
-    def run_requested(self) -> bool:
-        """True while the robot wants data captured: Data_Start on and Db_Stop off."""
-        with self._lock:
-            return self._start and not self._stop
+    def start_count(self) -> int:
+        """How many times Data_Start has turned ON."""
+        return self._count(self._tags[0])
 
     @property
     def tare_count(self) -> int:
-        """How many times IMU_Tare has turned on. A 1 s pulse counts once."""
+        """How many times IMU_Tare has turned ON. A 1 s pulse counts once."""
+        return self._count(self._tags[1])
+
+    @property
+    def stop_count(self) -> int:
+        """How many times Db_Stop has turned ON."""
+        return self._count(self._tags[2])
+
+    def _count(self, tag: str) -> int:
         with self._lock:
-            return self._tare_count
+            return self._counts[tag]
+
+    def snapshot(self) -> str:
+        """The current tag values, for log messages."""
+        with self._lock:
+            return " ".join(f"{tag}={self._values[tag]}" for tag in self._tags)
 
     @property
     def connected(self) -> bool:
@@ -130,7 +147,7 @@ class PLCSignalWatcher:
         return bool(result.value) if result.error is None else False
 
     def _run(self) -> None:
-        last_tare = False
+        first_read = True
         while not self._closing.is_set():
             try:
                 with self._plc_factory() as plc:
@@ -139,26 +156,26 @@ class PLCSignalWatcher:
                         self._last_error = None
 
                     while not self._closing.is_set():
-                        start_r, tare_r, stop_r = plc.read(*self._tags)
-                        start = self._as_bool(start_r)
-                        tare = self._as_bool(tare_r)
-                        stop = self._as_bool(stop_r)
-                        # A missing start or tare tag is a setup mistake worth
-                        # reporting. Db_Stop is optional.
-                        error = start_r.error or tare_r.error
+                        results = plc.read(*self._tags)
+                        errors = [f"{r.tag}: {r.error}" for r in results if r.error]
 
                         with self._lock:
-                            self._start = start
-                            self._stop = stop
-                            if tare and not last_tare:
-                                self._tare_count += 1
-                            self._last_error = str(error) if error else None
-                        last_tare = tare
+                            for tag, result in zip(self._tags, results):
+                                value = self._as_bool(result)
+                                # A tag that is already ON when the watcher
+                                # starts is not counted: only a fresh OFF->ON
+                                # change starts, tares or stops anything.
+                                if value and not self._values[tag] and not first_read:
+                                    self._counts[tag] += 1
+                                self._values[tag] = value
+                            self._last_error = "; ".join(errors) or None
+                        first_read = False
 
                         self._closing.wait(self._poll_s)
             except Exception as error:  # connection lost or refused: retry
-                # The last known signal state is kept, so a short network
-                # glitch does not cut a run in half.
+                # Signals that arrive while disconnected are missed; the
+                # last known values are kept so no false edge is seen on
+                # reconnect.
                 with self._lock:
                     self._connected = False
                     self._last_error = str(error)

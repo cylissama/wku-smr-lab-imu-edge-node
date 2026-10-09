@@ -36,6 +36,7 @@ class EdgeAgentConfig:
     plc_poll_s: float
     plc_fake: bool
     plc_fake_speed: float
+    plc_max_run_s: float
 
     @classmethod
     def from_env(cls) -> "EdgeAgentConfig":
@@ -65,4 +66,5 @@ class EdgeAgentConfig:
             plc_poll_s=max(0.01, float(os.getenv("IMU_PLC_POLL_S", "0.05"))),
             plc_fake=_env_flag("IMU_PLC_FAKE", False),
             plc_fake_speed=float(os.getenv("IMU_PLC_FAKE_SPEED", "1.0")),
+            plc_max_run_s=float(os.getenv("IMU_PLC_MAX_RUN_S", "600")),
         )

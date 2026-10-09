@@ -78,11 +78,12 @@ class EdgeAgent:
 
     def _run_plc_triggered(self, writer) -> None:
         """
-        Let the robot cell's PLC drive the run:
+        Let the robot cell's PLC drive each run. The PLC sends short pulses,
+        so only a tag turning ON matters; turning OFF is ignored:
 
-            Data_Start ON   -> start capturing (samples are read, not sent)
-            IMU_Tare ON     -> tare once, then send every sample from then on
-            Data_Start OFF  -> stop, and wait for the next run
+            Data_Start turns ON  -> start: stream and send IMU data
+            IMU_Tare turns ON    -> tare, keep sending
+            Db_Stop turns ON     -> stop sending, wait for the next Data_Start
         """
         watcher = PLCSignalWatcher(
             build_plc_factory(
@@ -104,7 +105,6 @@ class EdgeAgent:
                     if not self._wait_for_plc_start(watcher):
                         break
                     self._capture_one_run(watcher, writer)
-                    self._wait_for_plc_start_to_clear(watcher)
                 except ServiceError as error:
                     self.health.update(
                         state="degraded",
@@ -127,10 +127,11 @@ class EdgeAgent:
                 pass
 
     def _wait_for_plc_start(self, watcher: PLCSignalWatcher) -> bool:
-        """Block until Data_Start turns on. False if the agent is shutting down."""
+        """Block until Data_Start turns ON. False if the agent is shutting down."""
+        starts_seen = watcher.start_count
         last_health = 0.0
         while not self._stop_requested:
-            if watcher.run_requested:
+            if watcher.start_count > starts_seen:
                 return True
 
             # Keep the health file fresh so the container stays healthy
@@ -147,17 +148,15 @@ class EdgeAgent:
             time.sleep(self.config.plc_poll_s)
         return False
 
-    def _wait_for_plc_start_to_clear(self, watcher: PLCSignalWatcher) -> None:
-        """After a run ends, wait for Data_Start to drop before arming again."""
-        while not self._stop_requested and watcher.run_requested:
-            time.sleep(self.config.plc_poll_s)
-
     def _capture_one_run(self, watcher: PLCSignalWatcher, writer) -> None:
-        tares_before_run = watcher.tare_count
-        send_from_ms: int | None = None
-        first_sent_counter: int | None = None
-        tare_signal_seen = False
-        last_health = 0.0
+        tares_seen = watcher.tare_count
+        stops_seen = watcher.stop_count
+        run_started = time.monotonic()
+        max_run_s = self.config.plc_max_run_s
+        first_counter: int | None = None
+        sent = 0
+        tares = 0
+        end_reason = "the IMU service stopped sending data"
 
         # The tare comes later, from the PLC signal, not at session start.
         try:
@@ -172,52 +171,63 @@ class EdgeAgent:
         except ServiceError as error:
             if error.code != "SESSION_ALREADY_ACTIVE":
                 raise
-        print(f"PLC: {self.config.plc_tag_start} ON -> capturing (not sending yet)", flush=True)
+        print(
+            f"PLC: {self.config.plc_tag_start} ON -> streaming and sending"
+            f"   [{watcher.snapshot()}]",
+            flush=True,
+        )
 
         try:
             with self.client.stream() as stream:
                 for sample in stream:
-                    if self._stop_requested or not watcher.run_requested:
+                    if self._stop_requested:
+                        end_reason = "the agent was stopped"
+                        break
+                    if watcher.stop_count > stops_seen:
+                        end_reason = f"{self.config.plc_tag_stop} turned ON"
+                        break
+                    if max_run_s > 0 and time.monotonic() - run_started > max_run_s:
+                        end_reason = (
+                            f"no {self.config.plc_tag_stop} signal within "
+                            f"{max_run_s:g} s (IMU_PLC_MAX_RUN_S)"
+                        )
                         break
 
-                    if send_from_ms is None and watcher.tare_count > tares_before_run:
-                        tare_signal_seen = True
+                    if watcher.tare_count > tares_seen:
+                        tares_seen = watcher.tare_count
                         self.client.tare()
-                        send_from_ms = int(time.time_ns() / 1e6)
-                        print(f"PLC: {self.config.plc_tag_tare} ON -> tared, sending", flush=True)
+                        tares += 1
+                        print(
+                            f"PLC: {self.config.plc_tag_tare} ON -> tared at "
+                            f"{int(time.time_ns() / 1e6)} ms, still sending",
+                            flush=True,
+                        )
 
-                    # Send only samples taken after the tare. Samples already
-                    # queued from before it are dropped.
-                    if send_from_ms is not None and sample.capture_time_ms >= send_from_ms:
-                        if first_sent_counter is None:
-                            first_sent_counter = sample.counter
-                        # Number the sent samples from 0.
-                        sample.counter -= first_sent_counter
-                        writer.write_data(sample)
-                        self.health.update(
-                            state="streaming",
-                            session_id=self.config.session_id,
-                            last_capture_time_ms=sample.capture_time_ms,
-                            last_counter=sample.counter,
-                        )
-                    elif time.monotonic() - last_health > 1.0:
-                        self.health.update(
-                            state="waiting",
-                            detail=f"capturing, waiting for PLC tag {self.config.plc_tag_tare}",
-                        )
-                        last_health = time.monotonic()
+                    # Number the samples of each run from 0.
+                    if first_counter is None:
+                        first_counter = sample.counter
+                    sample.counter -= first_counter
+                    writer.write_data(sample)
+                    sent += 1
+                    self.health.update(
+                        state="streaming",
+                        session_id=self.config.session_id,
+                        last_capture_time_ms=sample.capture_time_ms,
+                        last_counter=sample.counter,
+                    )
+        except Exception as error:
+            end_reason = f"error: {type(error).__name__}: {error}"
+            raise
         finally:
             try:
                 self.client.stop_session()
             except (ServiceError, OSError):
                 pass
-            if send_from_ms is not None:
-                sent = "data was sent"
-            elif tare_signal_seen:
-                sent = "the tare failed, nothing was sent"
-            else:
-                sent = "no tare signal came, nothing was sent"
-            print(f"PLC: run ended ({sent})", flush=True)
+            tare_note = f"{tares} tare(s)" if tares else f"no {self.config.plc_tag_tare} signal came"
+            print(
+                f"PLC: run ended ({sent} samples sent, {tare_note}); reason: {end_reason}",
+                flush=True,
+            )
 
     def _wait_until_ready(self) -> None:
         while not self._stop_requested:
